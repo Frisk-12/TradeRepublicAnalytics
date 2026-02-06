@@ -136,6 +136,16 @@ class UnsupportedStatementFormatError(StatementParseError):
     """Raised when the PDF does not match the expected Trade Republic account statement structure."""
 
 
+def _format_unknown_tokens_suffix(tokens: List[str]) -> str:
+    if not tokens:
+        return ""
+    cleaned = sorted({t for t in tokens if t})
+    if not cleaned:
+        return ""
+    joined = ", ".join(cleaned[:25])
+    return f" Unrecognized transaction tokens: {joined}."
+
+
 def _resolve_pdftotext() -> str:
     candidate = (PDFTOTEXT or "").strip()
     if candidate:
@@ -468,6 +478,76 @@ def _parse_summary_block(text: str) -> List[Dict[str, Optional[float]]]:
     return summary
 
 
+def _collect_unrecognized_transaction_tokens(text: str) -> List[str]:
+    lines = text.splitlines()
+    in_tx = False
+    unknown: set[str] = set()
+
+    known = set(TYPE_ALIASES.keys())
+    skip_tokens = {
+        "data",
+        "date",
+        "description",
+        "descrizione",
+        "solde",
+        "saldo",
+        "balance",
+        "account",
+        "compte",
+        "type",
+        "in",
+        "out",
+    }
+
+    for raw in lines:
+        line = raw.rstrip("\n")
+        if any(m in line.upper() for m in TX_SECTION_MARKERS):
+            in_tx = True
+            continue
+        if not in_tx:
+            continue
+        if _line_has_footer(line) or _line_is_header(line):
+            continue
+        if not line.strip():
+            continue
+        if line.strip().lower().startswith(("data", "date")):
+            continue
+
+        amounts = _parse_amounts(line)
+        if not amounts:
+            continue
+
+        text_no_amounts = _normalize_spaces(_strip_amounts(line))
+        # Strip leading date chunks to isolate the transaction-type token.
+        s = text_no_amounts
+        s = re.sub(r"^\s*\d{4}\b", "", s).strip()  # optional leading year
+        had_day = False
+        m_day = re.match(r"^\s*(\d{1,2})\b", s)
+        if m_day:
+            had_day = True
+            s = s[m_day.end() :].strip()
+        if had_day:
+            m_mon = re.match(r"^\s*([A-Za-zÀ-ÿ\.]{3,12})\b", s)
+            if m_mon and _month_to_num(m_mon.group(1)):
+                s = s[m_mon.end() :].strip()
+            s = re.sub(r"^\s*\d{4}\b", "", s).strip()  # optional year after day+month
+        text_no_amounts = s
+        if not text_no_amounts:
+            continue
+        first = text_no_amounts.split(" ", 1)[0]
+        token = _normalize_token(first)
+        if not token or token.isdigit() or token in skip_tokens or token in known:
+            continue
+        # Ignore likely day/month artifacts.
+        if token in MONTHS or _month_to_num(token):
+            continue
+        # Keep only alphabetic-ish short words likely to be transaction types.
+        if len(token) <= 18 and re.fullmatch(r"[a-z0-9]+", token):
+            unknown.add(token)
+
+    return sorted(unknown)
+
+
 def _parse_transactions(text: str) -> List[Dict[str, Optional[object]]]:
     lines = text.splitlines()
     transactions: List[Dict[str, Optional[str]]] = []
@@ -641,21 +721,26 @@ def _validate_statement_structure(
     text: str,
     transactions: List[Dict[str, Optional[object]]],
 ) -> None:
+    unknown_tokens = _collect_unrecognized_transaction_tokens(text)
+    suffix = _format_unknown_tokens_suffix(unknown_tokens)
     text_up = (text or "").upper()
     if "TRADE REPUBLIC" not in text_up:
         raise UnsupportedStatementFormatError(
             "Invalid statement format: missing Trade Republic markers. "
             "Upload a Trade Republic Account Statement PDF."
+            + suffix
         )
     if not any(marker in text_up for marker in TX_SECTION_MARKERS):
         raise UnsupportedStatementFormatError(
             "Invalid statement format: account-transactions section not found. "
             "Upload a full Trade Republic Account Statement PDF."
+            + suffix
         )
     if not transactions:
         raise UnsupportedStatementFormatError(
             "Invalid statement format: no account transactions were parsed. "
             "The file may not be a Trade Republic Account Statement."
+            + suffix
         )
 
     valid_rows = 0
@@ -668,6 +753,7 @@ def _validate_statement_structure(
     if valid_rows == 0:
         raise UnsupportedStatementFormatError(
             "Invalid statement format: required transaction fields (date/type/balance) were not detected."
+            + suffix
         )
 
 
