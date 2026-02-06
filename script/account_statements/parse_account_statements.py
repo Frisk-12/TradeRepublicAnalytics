@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Parse Trade Republic account statement PDFs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import unicodedata
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+PDFTOTEXT = os.getenv("PDFTOTEXT_BIN", "pdftotext")
+_HASH_SEED = "account_statement_v1"
+
+MONTHS = {
+    "gen": "01",
+    "gennaio": "01",
+    "jan": "01",
+    "january": "01",
+    "janv": "01",
+    "janvier": "01",
+    "feb": "02",
+    "febbraio": "02",
+    "february": "02",
+    "fev": "02",
+    "fevr": "02",
+    "fevrier": "02",
+    "mar": "03",
+    "marzo": "03",
+    "march": "03",
+    "mars": "03",
+    "apr": "04",
+    "aprile": "04",
+    "april": "04",
+    "avr": "04",
+    "avril": "04",
+    "mag": "05",
+    "maggio": "05",
+    "may": "05",
+    "mai": "05",
+    "giu": "06",
+    "giugno": "06",
+    "jun": "06",
+    "june": "06",
+    "juin": "06",
+    "lug": "07",
+    "luglio": "07",
+    "jul": "07",
+    "july": "07",
+    "juil": "07",
+    "juillet": "07",
+    "ago": "08",
+    "agosto": "08",
+    "aug": "08",
+    "august": "08",
+    "aou": "08",
+    "aout": "08",
+    "set": "09",
+    "settembre": "09",
+    "sep": "09",
+    "sept": "09",
+    "september": "09",
+    "septembre": "09",
+    "ott": "10",
+    "ottobre": "10",
+    "oct": "10",
+    "october": "10",
+    "octobre": "10",
+    "nov": "11",
+    "novembre": "11",
+    "november": "11",
+    "dic": "12",
+    "dicembre": "12",
+    "dec": "12",
+    "december": "12",
+    "decembre": "12",
+}
+
+TX_SECTION_MARKERS = (
+    "TRANSAZIONI SUL CONTO",
+    "ACCOUNT TRANSACTIONS",
+    "TRANSACTIONS DU COMPTE",
+)
+
+SUMMARY_START_MARKERS = (
+    "ESTRATTO CONTO RIASSUNTIVO",
+    "ACCOUNT STATEMENT SUMMARY",
+    "RESUME DU COMPTE",
+)
+
+TYPE_ALIASES = {
+    "bonifico": "Bonifico",
+    "transfer": "Bonifico",
+    "transfert": "Bonifico",
+    "virement": "Bonifico",
+    "deposit": "Bonifico",
+    "versement": "Bonifico",
+    "commercio": "Commercio",
+    "trade": "Commercio",
+    "transaction": "Commercio",
+    "transactione": "Commercio",
+    "interessi": "Interessi",
+    "interest": "Interessi",
+    "interet": "Interessi",
+    "interets": "Interessi",
+    "rendimento": "Rendimento",
+    "yield": "Rendimento",
+    "return": "Rendimento",
+    "rendement": "Rendimento",
+    "dividend": "Rendimento",
+    "dividende": "Rendimento",
+    "imposte": "Imposte",
+    "tax": "Imposte",
+    "taxes": "Imposte",
+    "impot": "Imposte",
+    "impots": "Imposte",
+    "tasse": "Imposte",
+    "premio": "Premio",
+    "bonus": "Premio",
+    "prime": "Premio",
+}
+
+
+class StatementParseError(RuntimeError):
+    """Raised when a statement cannot be parsed as a valid Trade Republic account statement."""
+
+
+class UnsupportedStatementFormatError(StatementParseError):
+    """Raised when the PDF does not match the expected Trade Republic account statement structure."""
+
+
+def _resolve_pdftotext() -> str:
+    candidate = (PDFTOTEXT or "").strip()
+    if candidate:
+        if Path(candidate).is_file():
+            return candidate
+        from_path = shutil.which(candidate)
+        if from_path:
+            return from_path
+    fallback = shutil.which("pdftotext")
+    if fallback:
+        return fallback
+    raise RuntimeError(
+        "pdftotext binary not found. Install poppler-utils (Linux) "
+        "or set environment variable PDFTOTEXT_BIN to the executable path."
+    )
+
+
+def _amount_to_float(value: str) -> float:
+    return float(value.replace(".", "").replace(",", "."))
+
+
+def _normalize_token(value: str) -> str:
+    s = unicodedata.normalize("NFKD", str(value or ""))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _month_to_num(token: str) -> Optional[str]:
+    key = _normalize_token(token)
+    return MONTHS.get(key) or MONTHS.get(key[:3])
+
+
+def _parse_date_locale(value: str) -> Optional[str]:
+    m = re.match(r"\s*(\d{1,2})\s+([A-Za-zÀ-ÿ\.]{3,12})\s+(\d{4})\s*$", value, flags=re.IGNORECASE)
+    if not m:
+        return None
+    day, mon, year = m.group(1), m.group(2), m.group(3)
+    month_num = _month_to_num(mon)
+    if not month_num:
+        return None
+    return f"{year}-{month_num}-{int(day):02d}"
+
+
+def _parse_trade_description(description: str) -> Dict[str, Optional[object]]:
+    """
+    Parse 'Commercio' descriptions, extracting:
+    - side: Buy/Sell
+    - isin
+    - instrument_name
+    - quantity (float)
+    - share_class: Acc/Dist/Accumulative if present
+    """
+    out: Dict[str, Optional[object]] = {
+        "side": None,
+        "isin": None,
+        "instrument_name": None,
+        "quantity": None,
+        "share_class": None,
+    }
+
+    desc = _normalize_spaces(description)
+
+    # side
+    m_side = re.search(r"\b(Buy|Sell)\s+trade\b", desc, flags=re.IGNORECASE)
+    if m_side:
+        out["side"] = m_side.group(1).capitalize()
+    else:
+        m_side_fr = re.search(r"\b(Achat|Vente)\b", desc, flags=re.IGNORECASE)
+        if m_side_fr:
+            out["side"] = "Buy" if m_side_fr.group(1).lower().startswith("achat") else "Sell"
+
+    # ISIN
+    m_isin = re.search(r"\b([A-Z]{2}[A-Z0-9]{9}[0-9])\b", desc)
+    if m_isin:
+        out["isin"] = m_isin.group(1)
+
+    # quantity
+    m_qty = re.search(r"\b(quantity|quantite|quantita)[: ]\s*([0-9]+(?:[.,][0-9]+)?)\b", desc, flags=re.IGNORECASE)
+    if m_qty:
+        try:
+            out["quantity"] = float(m_qty.group(2).replace(",", "."))
+        except ValueError:
+            out["quantity"] = None
+
+    # share class
+    share_markers = [
+        "acc",
+        "acc.",
+        "accumulating",
+        "accumulative",
+        "dist",
+        "dist.",
+        "distributing",
+        "distribution",
+        "hedged",
+    ]
+    for marker in share_markers:
+        if re.search(rf"\b{re.escape(marker)}\b", desc, flags=re.IGNORECASE):
+            out["share_class"] = marker.replace(".", "").capitalize()
+            break
+    if out["share_class"] in {"Acc", "Accumulating"}:
+        out["share_class"] = "Acc"
+    if out["share_class"] in {"Dist", "Distributing"}:
+        out["share_class"] = "Dist"
+
+    # instrument name (best-effort)
+    name = desc
+    name = re.sub(r"^.*?\b(Buy|Sell)\s+trade\b\s+", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"^.*?\b(Achat|Vente)\b\s+", "", name, flags=re.IGNORECASE)
+    if out["isin"]:
+        name = name.replace(out["isin"], "").strip()
+    name = re.sub(r",?\s*quantity:\s*[0-9]+(?:[.,][0-9]+)?", "", name, flags=re.IGNORECASE).strip()
+    out["instrument_name"] = name if name else None
+
+    return out
+
+
+def _transaction_id(
+    filename: str,
+    date: Optional[str],
+    typ: Optional[str],
+    description: Optional[str],
+    saldo: Optional[float],
+    in_entrata: Optional[float],
+    in_uscita: Optional[float],
+) -> str:
+    import hashlib
+
+    payload = "|".join(
+        [
+            _HASH_SEED,
+            filename or "",
+            date or "",
+            typ or "",
+            description or "",
+            f"{saldo:.4f}" if saldo is not None else "",
+            f"{in_entrata:.4f}" if in_entrata is not None else "",
+            f"{in_uscita:.4f}" if in_uscita is not None else "",
+        ]
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def extract_text(pdf_path: Path) -> str:
+    bin_path = _resolve_pdftotext()
+    try:
+        result = subprocess.run(
+            [bin_path, "-layout", str(pdf_path), "-"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"pdftotext not found at {bin_path}") from exc
+    return result.stdout
+
+
+def _normalize_spaces(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _parse_amounts(line: str) -> List[float]:
+    values: List[float] = []
+    for m in re.finditer(r"([0-9\.]+,[0-9]{2})\s*€", line):
+        raw = m.group(1)
+        values.append(_amount_to_float(raw))
+    return values
+
+
+def _strip_amounts(line: str) -> str:
+    return re.sub(r"[0-9\.]+,[0-9]{2}\s*€", "", line)
+
+
+def _line_has_footer(line: str) -> bool:
+    l = line.strip().lower()
+    l_norm = unicodedata.normalize("NFKD", l)
+    l_norm = "".join(ch for ch in l_norm if not unicodedata.combining(ch))
+    if (
+        l.startswith("trade republic bank")
+        or l_norm.startswith("generato il")
+        or l_norm.startswith("generated on")
+        or l_norm.startswith("genere le")
+        or l_norm.startswith("pagina")
+        or l_norm.startswith("page")
+    ):
+        return True
+    footer_markers = (
+        "www.traderepublic.it",
+        "sede centrale",
+        "direttore generale",
+        "registro commerciale",
+        "camera di commercio",
+        "brunnenstrasse",
+        "p. iva",
+        "spaces gae aulenti",
+        "andreas torner",
+        "gernot mittendorfer",
+        "christian hecker",
+        "thomas pischke",
+    )
+    return any(marker in l for marker in footer_markers)
+
+
+def _infer_single_amount_direction(txn_type: Optional[str], description: str) -> str:
+    typ = (txn_type or "").strip().lower()
+    desc = (description or "").strip().lower()
+
+    if typ in {"bonifico", "interessi", "rendimento", "premio"}:
+        return "in"
+    if typ in {"imposte"}:
+        return "out"
+    if typ == "commercio":
+        if "sell trade" in desc:
+            return "in"
+        if "buy trade" in desc or "ordine d'acquisto" in desc:
+            return "out"
+
+    inflow_keywords = (
+        "incoming",
+        "dividend",
+        "dividende",
+        "interest payment",
+        "interessi",
+        "interet",
+        "interets",
+        "rendimento",
+        "rendement",
+        "bonus",
+        "prime",
+        "refund",
+        "warrant exercise",
+        "sell trade",
+        "ordre de vente",
+        "vente",
+    )
+    outflow_keywords = (
+        "buy trade",
+        "ordre d'achat",
+        "achat",
+        "tax",
+        "impot",
+        "impots",
+        "stamp duty",
+        "imposte",
+        "ordine d'acquisto",
+    )
+    if any(k in desc for k in inflow_keywords):
+        return "in"
+    if any(k in desc for k in outflow_keywords):
+        return "out"
+    return "out"
+
+
+def _line_is_header(line: str) -> bool:
+    l = line.strip().lower()
+    if not l:
+        return False
+    header_markers = (
+        "trade republic",
+        "branch italy",
+        "spaces gae aulenti",
+        "piazza gae aulenti",
+        "torre b",
+    )
+    if any(marker in l for marker in header_markers):
+        return True
+    if (l.startswith("data") or l.startswith("date")) and ("descrizione" in l or "description" in l):
+        return True
+    return False
+
+
+def _parse_date_range(text: str) -> Optional[Tuple[str, str]]:
+    patterns = [
+        r"(?:DATA|DATE|PERIOD|PERIODE|PERIODE)\s+(\d{1,2}\s+[A-Za-zÀ-ÿ\.]{3,12}\s+\d{4})\s*-\s*(\d{1,2}\s+[A-Za-zÀ-ÿ\.]{3,12}\s+\d{4})",
+        r"(\d{1,2}\s+[A-Za-zÀ-ÿ\.]{3,12}\s+\d{4})\s*-\s*(\d{1,2}\s+[A-Za-zÀ-ÿ\.]{3,12}\s+\d{4})",
+    ]
+    for p in patterns:
+        m = re.search(p, text, flags=re.IGNORECASE)
+        if not m:
+            continue
+        start = _parse_date_locale(m.group(1))
+        end = _parse_date_locale(m.group(2))
+        if start and end:
+            return start, end
+    return None
+
+
+def _parse_account_info(text: str) -> Dict[str, Optional[str]]:
+    info: Dict[str, Optional[str]] = {
+        "iban": None,
+        "bic": None,
+    }
+    iban = re.search(r"IBAN\s+([A-Z0-9]+)", text)
+    if iban:
+        info["iban"] = iban.group(1)
+    bic = re.search(r"BIC\s+([A-Z0-9]+)", text)
+    if bic:
+        info["bic"] = bic.group(1)
+    return info
+
+
+def _parse_summary_block(text: str) -> List[Dict[str, Optional[float]]]:
+    lines = text.splitlines()
+    summary: List[Dict[str, str]] = []
+    in_summary = False
+    for line in lines:
+        if any(m in line.upper() for m in SUMMARY_START_MARKERS):
+            in_summary = True
+            continue
+        if in_summary and any(m in line.upper() for m in TX_SECTION_MARKERS):
+            break
+        if not in_summary:
+            continue
+        if not line.strip():
+            continue
+        if line.strip().upper().startswith(("PRODOTTO", "PRODUCT", "PRODUIT")):
+            continue
+        amounts = _parse_amounts(line)
+        if len(amounts) >= 2:
+            product = _normalize_spaces(_strip_amounts(line))
+            summary.append(
+                {
+                    "product": product,
+                    "saldo_iniziale": amounts[0] if len(amounts) > 0 else None,
+                    "in_entrata": amounts[1] if len(amounts) > 1 else None,
+                    "in_uscita": amounts[2] if len(amounts) > 2 else None,
+                    "saldo_finale": amounts[3] if len(amounts) > 3 else None,
+                }
+            )
+    return summary
+
+
+def _parse_transactions(text: str) -> List[Dict[str, Optional[object]]]:
+    lines = text.splitlines()
+    transactions: List[Dict[str, Optional[str]]] = []
+    in_tx = False
+    pending_day: Optional[str] = None
+    pending_month: Optional[str] = None
+    current_year: Optional[str] = None
+    current: Optional[Dict[str, Optional[str]]] = None
+    seq = 0
+
+    def ensure_current() -> Dict[str, Optional[str]]:
+        nonlocal current
+        if current is None:
+            current = {
+                "date": None,
+                "type": None,
+                "description": None,
+                "in_entrata": None,
+                "in_uscita": None,
+                "saldo": None,
+            }
+        return current
+
+    for raw in lines:
+        line = raw.rstrip("\n")
+        if any(m in line.upper() for m in TX_SECTION_MARKERS):
+            in_tx = True
+            continue
+        if not in_tx:
+            continue
+        if _line_has_footer(line) or _line_is_header(line):
+            continue
+        if line.strip().lower().startswith(("data", "date")):
+            continue
+        if not line.strip():
+            continue
+
+        # year-only line
+        year_only = re.fullmatch(r"\s*(\d{4})\s*", line)
+        if year_only:
+            current_year = year_only.group(1)
+            if pending_day and pending_month and transactions:
+                month_num = _month_to_num(pending_month)
+                if month_num:
+                    transactions[-1]["date"] = f"{current_year}-{month_num}-{int(pending_day):02d}"
+                pending_day = None
+                pending_month = None
+            continue
+
+        # year at start of line (may include other text)
+        year_start = re.match(r"\s*(\d{4})\b", line)
+        if year_start:
+            current_year = year_start.group(1)
+            line = line[year_start.end() :].strip()
+            if pending_day and pending_month and transactions and transactions[-1].get("date") is None:
+                month_num = _month_to_num(pending_month)
+                if month_num:
+                    transactions[-1]["date"] = f"{current_year}-{month_num}-{int(pending_day):02d}"
+                pending_day = None
+                pending_month = None
+
+        # detect day + month (possibly at line start)
+        dm = re.match(r"\s*(\d{1,2})\s+([A-Za-zÀ-ÿ\.]{3,12})\b", line, flags=re.IGNORECASE)
+        if dm:
+            pending_day = dm.group(1)
+            pending_month = dm.group(2)
+            line = line[dm.end() :].strip()
+
+        # detect day only on line
+        day_only = re.fullmatch(r"\s*(\d{1,2})\s*", line)
+        if day_only:
+            pending_day = day_only.group(1)
+            continue
+
+        # detect month at line start (may include other text)
+        month_start = re.match(r"\s*([A-Za-zÀ-ÿ\.]{3,12})\b", line, flags=re.IGNORECASE)
+        if month_start and pending_day and _month_to_num(month_start.group(1)):
+            pending_month = month_start.group(1)
+            line = line[month_start.end() :].strip()
+
+        amounts = _parse_amounts(line)
+        text_no_amounts = _normalize_spaces(_strip_amounts(line))
+
+        # extract type if present as first token
+        parts = text_no_amounts.split(" ", 1)
+        typ = None
+        desc = text_no_amounts
+        if parts:
+            normalized = _normalize_token(parts[0])
+            canonical = TYPE_ALIASES.get(normalized)
+            if canonical:
+                typ = canonical
+                desc = parts[1] if len(parts) > 1 else ""
+
+        # continuation line after amounts: append to last transaction
+        if not amounts and current is None and transactions and desc and typ is None and pending_day is None and pending_month is None:
+            last = transactions[-1]
+            if last.get("description"):
+                last["description"] = _normalize_spaces(f"{last['description']} {desc}")
+            else:
+                last["description"] = desc
+            continue
+
+        if amounts:
+            txn = ensure_current()
+            if typ and not txn["type"]:
+                txn["type"] = typ
+            if desc:
+                if txn["description"]:
+                    txn["description"] = _normalize_spaces(f"{txn['description']} {desc}")
+                else:
+                    txn["description"] = desc
+
+            # assign amounts
+            balance = amounts[-1]
+            in_amt = None
+            out_amt = None
+            if len(amounts) == 2:
+                direction = _infer_single_amount_direction(txn.get("type"), txn.get("description") or "")
+                if direction == "in":
+                    in_amt = amounts[0]
+                else:
+                    out_amt = amounts[0]
+            elif len(amounts) >= 3:
+                in_amt = amounts[0]
+                out_amt = amounts[1]
+
+            txn["in_entrata"] = in_amt if in_amt is not None else 0.0
+            txn["in_uscita"] = out_amt if out_amt is not None else 0.0
+            txn["saldo"] = balance if balance is not None else 0.0
+            txn["cash_flow"] = txn["in_entrata"] - txn["in_uscita"]
+            seq += 1
+            txn["seq"] = seq
+
+            if txn.get("date") is None and pending_day and pending_month and current_year:
+                month_num = _month_to_num(pending_month)
+                if month_num:
+                    txn["date"] = f"{current_year}-{month_num}-{int(pending_day):02d}"
+                pending_day = None
+                pending_month = None
+
+            transactions.append(txn)
+            current = None
+        else:
+            if not text_no_amounts:
+                continue
+            txn = ensure_current()
+            if typ and not txn["type"]:
+                txn["type"] = typ
+            if desc:
+                if txn["description"]:
+                    txn["description"] = _normalize_spaces(f"{txn['description']} {desc}")
+                else:
+                    txn["description"] = desc
+
+    if transactions and transactions[-1].get("date") is None and pending_day and pending_month and current_year:
+        month_num = _month_to_num(pending_month)
+        if month_num:
+            transactions[-1]["date"] = f"{current_year}-{month_num}-{int(pending_day):02d}"
+
+    # Ensure trade parsing for Commercio rows after all descriptions are finalized.
+    for txn in transactions:
+        if txn.get("type") == "Commercio" and txn.get("description"):
+            txn["trade"] = _parse_trade_description(txn["description"])
+
+    return transactions
+
+
+def _validate_statement_structure(
+    *,
+    text: str,
+    transactions: List[Dict[str, Optional[object]]],
+) -> None:
+    text_up = (text or "").upper()
+    if "TRADE REPUBLIC" not in text_up:
+        raise UnsupportedStatementFormatError(
+            "Invalid statement format: missing Trade Republic markers. "
+            "Upload a Trade Republic Account Statement PDF."
+        )
+    if not any(marker in text_up for marker in TX_SECTION_MARKERS):
+        raise UnsupportedStatementFormatError(
+            "Invalid statement format: account-transactions section not found. "
+            "Upload a full Trade Republic Account Statement PDF."
+        )
+    if not transactions:
+        raise UnsupportedStatementFormatError(
+            "Invalid statement format: no account transactions were parsed. "
+            "The file may not be a Trade Republic Account Statement."
+        )
+
+    valid_rows = 0
+    for txn in transactions:
+        has_date = bool(txn.get("date"))
+        has_type = bool(txn.get("type"))
+        has_balance = txn.get("saldo") is not None
+        if has_date and has_type and has_balance:
+            valid_rows += 1
+    if valid_rows == 0:
+        raise UnsupportedStatementFormatError(
+            "Invalid statement format: required transaction fields (date/type/balance) were not detected."
+        )
+
+
+def parse_account_statement(pdf_path: Path) -> Dict[str, object]:
+    text = extract_text(pdf_path)
+    date_range = _parse_date_range(text)
+    info = _parse_account_info(text)
+    summary = _parse_summary_block(text)
+    transactions = _parse_transactions(text)
+    _validate_statement_structure(text=text, transactions=transactions)
+    for txn in transactions:
+        txn["id"] = _transaction_id(
+            pdf_path.name,
+            txn.get("date"),
+            txn.get("type"),
+            txn.get("description"),
+            txn.get("saldo"),
+            txn.get("in_entrata"),
+            txn.get("in_uscita"),
+        )
+
+    return {
+        "file": pdf_path.name,
+        "date_range": date_range,
+        "account_info": info,
+        "summary": summary,
+        "transactions": transactions,
+    }
+
+
+def parse_all(statements_dir: str) -> Dict[str, Dict[str, object]]:
+    base = Path(statements_dir)
+    pdfs = sorted(base.glob("*.pdf"))
+    if not pdfs:
+        raise SystemExit(f"No PDF files found in {base}")
+
+    out: Dict[str, Dict[str, object]] = {}
+    for pdf in pdfs:
+        try:
+            out[pdf.name] = parse_account_statement(pdf)
+        except StatementParseError as exc:
+            raise StatementParseError(f"{pdf.name}: {exc}") from exc
+    return out
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Parse Trade Republic account statements.")
+    parser.add_argument(
+        "--statements-dir",
+        default="/Users/andreadesogus/Desktop/portfolio_analytics/data/account_statement",
+        help="Directory containing account statement PDFs.",
+    )
+    parser.add_argument(
+        "--output-json",
+        default=None,
+        help="Optional path to write JSON output.",
+    )
+    args = parser.parse_args()
+
+    data = parse_all(args.statements_dir)
+
+    global ACCOUNT_STATEMENTS_DATA
+    ACCOUNT_STATEMENTS_DATA = data
+    if args.output_json:
+        Path(args.output_json).write_text(json.dumps(data, indent=2, ensure_ascii=True))
+    else:
+        print(data)
+
+
+if __name__ == "__main__":
+    main()
